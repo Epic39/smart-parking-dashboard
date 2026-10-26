@@ -1,7 +1,8 @@
+
 streamlit
 pandas
 numpy
 scikit-learn
 plotly
 requests
-pyspark
+pyspark==4.0.1
