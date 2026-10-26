@@ -6,3 +6,4 @@ scikit-learn
 plotly
 requests
 pyspark==3.5.4
+setuptools
