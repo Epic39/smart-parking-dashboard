@@ -1,40 +1,58 @@
 
 import io
 import zipfile
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+from pyspark.sql import SparkSession, Window
+from pyspark.sql import functions as F
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
+
+# =========================================================
+# 1. PAGE CONFIGURATION
+# =========================================================
 st.set_page_config(
     page_title="Smart Parking Analytics",
     page_icon="🅿️",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("🅿️ Smart Parking Availability Analytics")
 st.markdown(
-    "Explore historical parking occupancy, compare car parks, "
-    "and estimate future parking availability using machine learning."
+    "A data analytics dashboard combining PySpark processing, "
+    "historical parking analysis, and machine-learning predictions."
 )
+st.caption("Birmingham, UK | Historical dataset from 2016")
 
-st.caption(
-    "Dataset: Birmingham, UK | Historical observations from 2016"
-)
 
-# --------------------------------------------------
-# LOAD THE OFFICIAL UCI DATASET DIRECTLY
-# --------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="Loading parking dataset...")
-def load_data():
+# =========================================================
+# 2. CREATE PYSPARK SESSION
+# =========================================================
+@st.cache_resource
+def get_spark():
+    return (
+        SparkSession.builder
+        .appName("SmartParkingAnalytics")
+        .master("local[2]")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.driver.memory", "1g")
+        .getOrCreate()
+    )
+
+
+# =========================================================
+# 3. DOWNLOAD AND READ THE UCI ZIP DATASET
+# =========================================================
+@st.cache_data(ttl=3600, show_spinner="Downloading parking dataset...")
+def download_parking_csv():
     urls = [
         "https://archive.ics.uci.edu/ml/"
         "machine-learning-databases/00482/dataset.zip",
@@ -46,158 +64,244 @@ def load_data():
 
     for url in urls:
         try:
-            response = requests.get(url, timeout=45)
+            response = requests.get(
+                url,
+                timeout=60,
+                headers={"User-Agent": "SmartParkingAnalytics/1.0"},
+            )
             response.raise_for_status()
 
             with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
                 csv_files = [
                     name for name in archive.namelist()
                     if name.lower().endswith(".csv")
+                    and not name.startswith("__MACOSX")
                 ]
 
                 if not csv_files:
-                    raise ValueError("No CSV file was found inside the ZIP.")
+                    raise ValueError("No CSV file found in the ZIP archive.")
 
+                # Prefer the main dataset file when present.
                 preferred = [
                     name for name in csv_files
                     if name.lower().endswith("dataset.csv")
                 ]
-                csv_name = preferred[0] if preferred else csv_files[0]
+                chosen = preferred[0] if preferred else csv_files[0]
 
-                with archive.open(csv_name) as file:
-                    data = pd.read_csv(file)
+                with archive.open(chosen) as file:
+                    raw = pd.read_csv(file, dtype=str)
 
-            # Standardise column names to handle spaces/capitalisation.
             def normalise(name):
                 return "".join(
-                    char.lower()
-                    for char in str(name)
-                    if char.isalnum()
+                    ch.lower()
+                    for ch in str(name)
+                    if ch.isalnum()
                 )
 
             rename = {}
-            for column in data.columns:
-                key = normalise(column)
+            for col in raw.columns:
+                key = normalise(col)
 
-                if key == "systemcodenumber":
-                    rename[column] = "facility_id"
+                if key in ("systemcodenumber", "carparkid", "facilityid"):
+                    rename[col] = "facility_id"
                 elif key == "capacity":
-                    rename[column] = "capacity"
+                    rename[col] = "capacity"
                 elif key == "occupancy":
-                    rename[column] = "occupancy"
-                elif key == "lastupdated":
-                    rename[column] = "timestamp"
+                    rename[col] = "occupancy"
+                elif key in ("lastupdated", "timestamp", "datetime"):
+                    rename[col] = "timestamp"
 
-            data = data.rename(columns=rename)
+            raw = raw.rename(columns=rename)
 
             required = [
                 "facility_id", "capacity", "occupancy", "timestamp"
             ]
-            missing = [c for c in required if c not in data.columns]
+            missing = [col for col in required if col not in raw.columns]
 
             if missing:
                 raise ValueError(
-                    f"Missing columns: {missing}. "
-                    f"Columns received: {list(data.columns)}"
+                    f"Expected columns missing: {missing}. "
+                    f"Found columns: {list(raw.columns)}"
                 )
 
-            data = data[required].copy()
-            data["facility_id"] = data["facility_id"].astype(str).str.strip()
-            data["capacity"] = pd.to_numeric(
-                data["capacity"], errors="coerce"
-            )
-            data["occupancy"] = pd.to_numeric(
-                data["occupancy"], errors="coerce"
-            )
-            data["timestamp"] = pd.to_datetime(
-                data["timestamp"], errors="coerce"
-            )
+            return raw[required].copy()
 
-            data = data.dropna(subset=required)
-            data = data.drop_duplicates(
-                subset=["facility_id", "timestamp"]
-            )
-
-            data = data[
-                (data["capacity"] > 0)
-                & (data["occupancy"] >= 0)
-            ].copy()
-
-            # Keep occupancy within the recorded car park capacity.
-            data["occupancy"] = np.minimum(
-                data["occupancy"], data["capacity"]
-            )
-
-            data["free_spaces"] = (
-                data["capacity"] - data["occupancy"]
-            )
-            data["occupancy_rate"] = (
-                data["occupancy"] / data["capacity"]
-            )
-            data["hour"] = data["timestamp"].dt.hour
-            data["day_name"] = data["timestamp"].dt.day_name()
-            data["day_number"] = data["timestamp"].dt.dayofweek
-
-            data = data.sort_values(
-                ["facility_id", "timestamp"]
-            ).reset_index(drop=True)
-
-            if data.empty:
-                raise ValueError("The dataset has no usable records.")
-
-            return data
-
-        except Exception as error:
-            errors.append(f"{url}: {error}")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
 
     raise RuntimeError(
-        "Both official dataset download links failed.\n\n"
+        "Unable to download/read the official UCI dataset.\n"
         + "\n".join(errors)
     )
 
 
-try:
-    with st.spinner("Fetching the official parking dataset..."):
-        df = load_data()
-except Exception as error:
-    st.error("The parking dataset could not be loaded.")
-    st.markdown(
-        "Check your Streamlit deployment logs and try restarting "
-        "the app. The error details are shown below."
+# =========================================================
+# 4. PYSPARK DATA CLEANING AND FEATURE ENGINEERING
+# =========================================================
+@st.cache_data(ttl=3600, show_spinner="Processing data with PySpark...")
+def process_parking_data(raw):
+    spark = get_spark()
+
+    # Create a Spark DataFrame from the downloaded records.
+    spark_df = spark.createDataFrame(raw)
+
+    # Standardise types and remove invalid rows.
+    spark_df = (
+        spark_df
+        .withColumn("facility_id", F.trim(F.col("facility_id")))
+        .withColumn("capacity", F.col("capacity").cast("double"))
+        .withColumn("occupancy", F.col("occupancy").cast("double"))
+        .withColumn("timestamp", F.to_timestamp(F.col("timestamp")))
+        .filter(
+            F.col("facility_id").isNotNull()
+            & (F.col("facility_id") != "")
+            & F.col("capacity").isNotNull()
+            & F.col("occupancy").isNotNull()
+            & F.col("timestamp").isNotNull()
+            & (F.col("capacity") > 0)
+            & (F.col("occupancy") >= 0)
+        )
+        .dropDuplicates(["facility_id", "timestamp"])
+        .withColumn(
+            "occupancy",
+            F.least(F.col("occupancy"), F.col("capacity")),
+        )
+        .withColumn(
+            "free_spaces",
+            F.col("capacity") - F.col("occupancy"),
+        )
+        .withColumn(
+            "occupancy_rate",
+            F.col("occupancy") / F.col("capacity"),
+        )
+        .withColumn("hour", F.hour("timestamp"))
+        .withColumn("day_number", F.dayofweek("timestamp") - 2)
+        .withColumn(
+            "day_number",
+            F.when(F.col("day_number") < 0, 6)
+            .otherwise(F.col("day_number")),
+        )
+        .withColumn("day_name", F.date_format("timestamp", "EEEE"))
     )
-    st.exception(error)
+
+    # PySpark aggregations used by the dashboard.
+    facility_summary = (
+        spark_df.groupBy("facility_id")
+        .agg(
+            F.avg("occupancy_rate").alias("average_occupancy"),
+            F.max("capacity").alias("capacity"),
+            F.count("*").alias("observations"),
+        )
+        .orderBy("facility_id")
+        .toPandas()
+    )
+
+    hourly_summary = (
+        spark_df.groupBy("hour")
+        .agg(F.avg("occupancy_rate").alias("average_occupancy"))
+        .orderBy("hour")
+        .toPandas()
+    )
+
+    daily_summary = (
+        spark_df.groupBy("day_number", "day_name")
+        .agg(F.avg("occupancy_rate").alias("average_occupancy"))
+        .orderBy("day_number")
+        .toPandas()
+    )
+
+    # Use a Spark window to create lag and next-observation target features.
+    window = Window.partitionBy("facility_id").orderBy("timestamp")
+
+    feature_df = (
+        spark_df
+        .withColumn(
+            "previous_1",
+            F.lag("occupancy_rate", 1).over(window),
+        )
+        .withColumn(
+            "previous_2",
+            F.lag("occupancy_rate", 2).over(window),
+        )
+        .withColumn(
+            "target",
+            F.lead("occupancy_rate", 1).over(window),
+        )
+        .withColumn(
+            "hour_sin",
+            F.sin(2 * np.pi * F.col("hour") / 24),
+        )
+        .withColumn(
+            "hour_cos",
+            F.cos(2 * np.pi * F.col("hour") / 24),
+        )
+    )
+
+    # Collect only the fields required for the interactive dashboard/model.
+    clean_data = spark_df.orderBy(
+        "facility_id", "timestamp"
+    ).toPandas()
+
+    model_data = (
+        feature_df
+        .dropna(
+            subset=[
+                "previous_1", "previous_2", "target",
+                "hour_sin", "hour_cos",
+            ]
+        )
+        .orderBy("timestamp")
+        .toPandas()
+    )
+
+    return clean_data, facility_summary, hourly_summary, daily_summary, model_data
+
+
+try:
+    raw_data = download_parking_csv()
+    df, facility_summary, hourly_summary, daily_summary, model_data = (
+        process_parking_data(raw_data)
+    )
+except Exception as exc:
+    st.error("The dataset or PySpark pipeline failed.")
+    st.exception(exc)
+    st.info(
+        "Check the Streamlit deployment logs. PySpark requires a "
+        "compatible Java runtime and installed dependencies."
+    )
     st.stop()
 
 
-# --------------------------------------------------
-# SIDEBAR FILTERS
-# --------------------------------------------------
+# =========================================================
+# 5. SIDEBAR
+# =========================================================
 st.sidebar.title("Dashboard Controls")
 
-facilities = sorted(df["facility_id"].unique().tolist())
+facilities = sorted(df["facility_id"].astype(str).unique().tolist())
 
 selected_facility = st.sidebar.selectbox(
-    "Select a car park",
-    facilities
+    "Choose a car park",
+    facilities,
 )
 
 site = (
-    df[df["facility_id"] == selected_facility]
+    df[df["facility_id"].astype(str) == selected_facility]
     .sort_values("timestamp")
     .copy()
 )
 
 latest = site.iloc[-1]
 
-# --------------------------------------------------
-# TOP KPI CARDS
-# --------------------------------------------------
+
+# =========================================================
+# 6. KEY PERFORMANCE INDICATORS
+# =========================================================
 st.subheader("Parking Overview")
 
 k1, k2, k3, k4 = st.columns(4)
 
 k1.metric("Car Parks", f"{df['facility_id'].nunique():,}")
-k2.metric("Data Records", f"{len(df):,}")
+k2.metric("Clean Records", f"{len(df):,}")
 k3.metric("Selected Capacity", f"{int(latest['capacity']):,}")
 k4.metric("Latest Free Spaces", f"{int(latest['free_spaces']):,}")
 
@@ -206,52 +310,50 @@ st.caption(
     f"Last recorded observation: {latest['timestamp']}"
 )
 
-# --------------------------------------------------
-# OCCUPANCY GAUGE
-# --------------------------------------------------
+
+# =========================================================
+# 7. LATEST OCCUPANCY GAUGE
+# =========================================================
 st.subheader("Latest Recorded Occupancy")
 
-g1, g2 = st.columns([1, 2])
+left, right = st.columns([1, 1])
 
-with g1:
-    occupancy_pct = float(latest["occupancy_rate"]) * 100
+with left:
+    rate = float(latest["occupancy_rate"]) * 100
 
-    fig_gauge = {
-        "data": [{
-            "type": "indicator",
-            "mode": "gauge+number",
-            "value": round(occupancy_pct, 1),
-            "number": {"suffix": "%"},
-            "title": {"text": "Occupancy"},
-            "gauge": {
+    gauge = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=rate,
+            number={"suffix": "%"},
+            title={"text": "Occupancy Rate"},
+            gauge={
                 "axis": {"range": [0, 100]},
-                "bar": {"color": "#2563eb"},
                 "steps": [
-                    {"range": [0, 50], "color": "#dcfce7"},
+                    {"range": [0, 50], "color": "#d1fae5"},
                     {"range": [50, 80], "color": "#fef3c7"},
                     {"range": [80, 100], "color": "#fee2e2"},
                 ],
+                "bar": {"color": "#2563eb"},
             },
-        }],
-        "layout": {"height": 300, "margin": {"t": 60, "b": 10}},
-    }
+        )
+    )
+    gauge.update_layout(height=300, margin=dict(t=50, b=20))
+    st.plotly_chart(gauge, use_container_width=True)
 
-    st.plotly_chart(fig_gauge, use_container_width=True)
-
-with g2:
-    st.markdown("#### Latest recorded figures")
+with right:
     st.metric("Occupied Spaces", f"{int(latest['occupancy']):,}")
     st.metric("Available Spaces", f"{int(latest['free_spaces']):,}")
-    st.metric("Capacity", f"{int(latest['capacity']):,}")
-
+    st.metric("Total Capacity", f"{int(latest['capacity']):,}")
     st.progress(float(np.clip(latest["occupancy_rate"], 0, 1)))
 
-# --------------------------------------------------
-# HISTORICAL OCCUPANCY CHART
-# --------------------------------------------------
+
+# =========================================================
+# 8. HISTORICAL OCCUPANCY
+# =========================================================
 st.subheader("1. Historical Occupancy")
 
-history_chart = px.line(
+history = px.line(
     site,
     x="timestamp",
     y="occupancy_rate",
@@ -262,54 +364,48 @@ history_chart = px.line(
     },
     hover_data=["occupancy", "free_spaces", "capacity"],
 )
+history.update_yaxes(tickformat=".0%", range=[0, 1])
+history.update_layout(hovermode="x unified")
+st.plotly_chart(history, use_container_width=True)
 
-history_chart.update_yaxes(
-    tickformat=".0%",
-    range=[0, 1],
-)
-history_chart.update_layout(hovermode="x unified")
 
-st.plotly_chart(history_chart, use_container_width=True)
+# =========================================================
+# 9. HOURLY AND FACILITY ANALYSIS
+# =========================================================
+col1, col2 = st.columns(2)
 
-# --------------------------------------------------
-# TIME AND CAR PARK COMPARISONS
-# --------------------------------------------------
-left, right = st.columns(2)
-
-with left:
+with col1:
     st.subheader("2. Average Occupancy by Hour")
 
-    hourly = (
-        df.groupby("hour", as_index=False)["occupancy_rate"]
-        .mean()
-    )
+    hourly = hourly_summary.copy()
+    hourly["hour"] = pd.to_numeric(hourly["hour"], errors="coerce")
+    hourly = hourly.dropna(subset=["hour"]).sort_values("hour")
+    hourly["hour"] = hourly["hour"].astype(int)
 
     hourly_chart = px.bar(
         hourly,
         x="hour",
-        y="occupancy_rate",
+        y="average_occupancy",
         title="Average Occupancy by Hour of Day",
         labels={
             "hour": "Hour of Day",
-            "occupancy_rate": "Average Occupancy",
+            "average_occupancy": "Average Occupancy",
         },
+    )
+    hourly_chart.update_xaxes(
+        tickmode="linear", dtick=1, range=[-0.5, 23.5]
     )
     hourly_chart.update_yaxes(tickformat=".0%", range=[0, 1])
     st.plotly_chart(hourly_chart, use_container_width=True)
 
-with right:
+with col2:
     st.subheader("3. Car Park Comparison")
 
-    comparison = (
-        df.groupby("facility_id", as_index=False)
-        .agg(
-            average_occupancy=("occupancy_rate", "mean"),
-            capacity=("capacity", "max"),
-        )
-        .sort_values("average_occupancy", ascending=False)
+    comparison = facility_summary.sort_values(
+        "average_occupancy", ascending=False
     )
 
-    comparison_chart = px.bar(
+    facility_chart = px.bar(
         comparison,
         x="facility_id",
         y="average_occupancy",
@@ -318,75 +414,57 @@ with right:
             "facility_id": "Car Park",
             "average_occupancy": "Average Occupancy",
         },
-        hover_data=["capacity"],
+        hover_data=["capacity", "observations"],
     )
-    comparison_chart.update_yaxes(tickformat=".0%", range=[0, 1])
-    st.plotly_chart(comparison_chart, use_container_width=True)
+    facility_chart.update_xaxes(tickangle=-45)
+    facility_chart.update_yaxes(tickformat=".0%", range=[0, 1])
+    st.plotly_chart(facility_chart, use_container_width=True)
 
-# --------------------------------------------------
-# DAY-OF-WEEK ANALYSIS
-# --------------------------------------------------
+
+# =========================================================
+# 10. DAY-OF-WEEK ANALYSIS
+# =========================================================
 st.subheader("4. Occupancy by Day of Week")
 
 day_order = [
     "Monday", "Tuesday", "Wednesday", "Thursday",
-    "Friday", "Saturday", "Sunday"
+    "Friday", "Saturday", "Sunday",
 ]
 
-day_summary = (
-    df.groupby("day_name", as_index=False)["occupancy_rate"]
-    .mean()
+days = daily_summary.copy()
+days["day_number"] = pd.to_numeric(
+    days["day_number"], errors="coerce"
 )
-day_summary["day_name"] = pd.Categorical(
-    day_summary["day_name"],
-    categories=day_order,
-    ordered=True,
-)
-day_summary = day_summary.sort_values("day_name")
+days = days.dropna(subset=["day_number"])
+days["day_number"] = days["day_number"].astype(int)
+days = days.sort_values("day_number")
 
 day_chart = px.bar(
-    day_summary,
+    days,
     x="day_name",
-    y="occupancy_rate",
+    y="average_occupancy",
+    category_orders={"day_name": day_order},
+    title="Average Occupancy Across Days",
     labels={
         "day_name": "Day",
-        "occupancy_rate": "Average Occupancy",
+        "average_occupancy": "Average Occupancy",
     },
-    title="Average Occupancy Across Days",
 )
 day_chart.update_yaxes(tickformat=".0%", range=[0, 1])
 st.plotly_chart(day_chart, use_container_width=True)
 
-# --------------------------------------------------
-# MACHINE LEARNING FEATURE ENGINEERING
-# --------------------------------------------------
+
+# =========================================================
+# 11. MACHINE LEARNING: RANDOM FOREST
+# =========================================================
 st.subheader("5. Machine Learning Prediction")
 
 st.write(
-    "A Random Forest model predicts the occupancy rate at the "
-    "next recorded observation for each car park."
+    "PySpark creates the historical lag features. A Random Forest model "
+    "predicts the next recorded occupancy observation."
 )
 
-model_data = df.copy()
-
-model_data["previous_1"] = (
-    model_data.groupby("facility_id")["occupancy_rate"].shift(1)
-)
-model_data["previous_2"] = (
-    model_data.groupby("facility_id")["occupancy_rate"].shift(2)
-)
-model_data["target"] = (
-    model_data.groupby("facility_id")["occupancy_rate"].shift(-1)
-)
-
-model_data["hour_sin"] = np.sin(
-    2 * np.pi * model_data["hour"] / 24
-)
-model_data["hour_cos"] = np.cos(
-    2 * np.pi * model_data["hour"] / 24
-)
-
-feature_columns = [
+features = [
     "occupancy_rate",
     "previous_1",
     "previous_2",
@@ -395,124 +473,108 @@ feature_columns = [
     "capacity",
 ]
 
-training_data = (
-    model_data.dropna(
-        subset=feature_columns + ["target"]
-    )
-    .sort_values("timestamp")
-    .copy()
-)
-
-if len(training_data) < 100:
-    st.warning(
-        "There are not enough records to train a reliable model."
-    )
+if len(model_data) < 100:
+    st.warning("There are not enough observations to evaluate the model.")
     st.stop()
 
-# Use a chronological split: older observations for training,
-# newer observations for evaluation.
-split_index = int(len(training_data) * 0.8)
-
-train = training_data.iloc[:split_index].copy()
-test = training_data.iloc[split_index:].copy()
+split_index = int(len(model_data) * 0.8)
+train = model_data.iloc[:split_index].copy()
+test = model_data.iloc[split_index:].copy()
 
 if train.empty or test.empty:
-    st.error("Not enough records for a train/test split.")
+    st.error("The chronological train/test split is empty.")
     st.stop()
 
 X_train = pd.get_dummies(
-    train[feature_columns + ["facility_id"]],
+    train[features + ["facility_id"]],
     columns=["facility_id"],
 )
 X_test = pd.get_dummies(
-    test[feature_columns + ["facility_id"]],
+    test[features + ["facility_id"]],
     columns=["facility_id"],
-)
-X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
+).reindex(columns=X_train.columns, fill_value=0)
 
-y_train = train["target"]
-y_test = test["target"]
+y_train = train["target"].astype(float)
+y_test = test["target"].astype(float)
 
 model = RandomForestRegressor(
-    n_estimators=120,
+    n_estimators=100,
     max_depth=12,
     min_samples_leaf=2,
     random_state=42,
     n_jobs=-1,
 )
 
-with st.spinner("Training Random Forest model..."):
+with st.spinner("Training Random Forest..."):
     model.fit(X_train, y_train)
     predictions = np.clip(model.predict(X_test), 0, 1)
 
-mae = mean_absolute_error(y_test, predictions)
+model_mae = mean_absolute_error(y_test, predictions)
 baseline_mae = mean_absolute_error(
-    y_test, test["occupancy_rate"]
+    y_test, test["occupancy_rate"].astype(float)
 )
-r2 = r2_score(y_test, predictions)
+model_r2 = r2_score(y_test, predictions)
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Model MAE", f"{mae:.4f}")
-m2.metric("Persistence Baseline MAE", f"{baseline_mae:.4f}")
-m3.metric("Model R²", f"{r2:.3f}")
+m1.metric("Model MAE", f"{model_mae:.4f}")
+m2.metric("Baseline MAE", f"{baseline_mae:.4f}")
+m3.metric("Model R²", f"{model_r2:.3f}")
+
+if baseline_mae > 0:
+    improvement = (baseline_mae - model_mae) / baseline_mae * 100
+    st.write(f"MAE change versus baseline: {improvement:.1f}%")
 
 st.caption(
-    "MAE measures average absolute prediction error in occupancy-rate "
-    "units. The baseline predicts that the next occupancy rate will "
-    "equal the current one. R² can be negative if predictions perform "
-    "worse than a constant-mean benchmark."
+    "The evaluation uses a chronological split. MAE is the average "
+    "absolute error in occupancy-rate units. R² may be negative."
 )
 
-# --------------------------------------------------
-# NEXT-OBSERVATION PREDICTION
-# --------------------------------------------------
-prediction_rows = model_data[
-    model_data["facility_id"] == selected_facility
-].sort_values("timestamp")
 
-prediction_rows = prediction_rows.dropna(
-    subset=feature_columns
+# =========================================================
+# 12. PREDICTION FOR SELECTED CAR PARK
+# =========================================================
+st.markdown("### Prediction for Selected Car Park")
+
+selected_model_rows = (
+    model_data[model_data["facility_id"].astype(str) == selected_facility]
+    .sort_values("timestamp")
 )
 
-if not prediction_rows.empty:
-    current = prediction_rows.iloc[[-1]].copy()
+if not selected_model_rows.empty:
+    current = selected_model_rows.iloc[[-1]].copy()
 
     X_current = pd.get_dummies(
-        current[feature_columns + ["facility_id"]],
+        current[features + ["facility_id"]],
         columns=["facility_id"],
     ).reindex(columns=X_train.columns, fill_value=0)
 
-    predicted_rate = float(
-        np.clip(model.predict(X_current)[0], 0, 1)
-    )
-
+    predicted_rate = float(np.clip(model.predict(X_current)[0], 0, 1))
     capacity = int(current.iloc[0]["capacity"])
     predicted_occupied = int(round(predicted_rate * capacity))
     predicted_free = max(0, capacity - predicted_occupied)
 
-    st.markdown("### Prediction for selected car park")
-
     p1, p2, p3 = st.columns(3)
     p1.metric("Predicted Occupancy", f"{predicted_rate:.1%}")
-    p2.metric("Estimated Occupied Spaces", predicted_occupied)
-    p3.metric("Estimated Free Spaces", predicted_free)
+    p2.metric("Estimated Occupied", f"{predicted_occupied:,}")
+    p3.metric("Estimated Free Spaces", f"{predicted_free:,}")
 
     st.progress(predicted_rate)
-
-    st.info(
-        "This is a model estimate for the next recorded observation, "
-        "not a live sensor reading or a guaranteed future availability."
-    )
 else:
     st.warning(
-        "Not enough historical observations for this car park "
-        "to produce a prediction."
+        "Not enough historical records for a prediction for this car park."
     )
 
-# --------------------------------------------------
-# DATA TABLE AND DOWNLOAD
-# --------------------------------------------------
-with st.expander("View cleaned parking records"):
+st.info(
+    "This predicts the next recorded observation, not a guaranteed "
+    "time such as exactly one hour later. The dataset is historical, "
+    "not a live parking sensor feed."
+)
+
+
+# =========================================================
+# 13. DATA PREVIEW AND CSV DOWNLOAD
+# =========================================================
+with st.expander("View processed parking data"):
     st.dataframe(
         site[
             [
@@ -527,33 +589,49 @@ with st.expander("View cleaned parking records"):
         use_container_width=True,
     )
 
-    csv_data = site.to_csv(index=False).encode("utf-8")
-
     st.download_button(
-        "Download selected car park data as CSV",
-        data=csv_data,
-        file_name="parking_data.csv",
+        "Download selected car park CSV",
+        data=site.to_csv(index=False).encode("utf-8"),
+        file_name="smart_parking_data.csv",
         mime="text/csv",
     )
 
-# --------------------------------------------------
-# DATA SOURCE AND LIMITATIONS
-# --------------------------------------------------
+
+# =========================================================
+# 14. PYSPARK PROCESSING SUMMARY
+# =========================================================
+with st.expander("PySpark processing details"):
+    st.write("This application uses PySpark for:")
+    st.markdown(
+        """
+        - Type conversion and validation
+        - Removing duplicate car-park observations
+        - Calculating occupied and free spaces
+        - Creating hour and day features
+        - Aggregating occupancy by hour and car park
+        - Window functions (`lag` and `lead`) for prediction features
+        """
+    )
+    st.write(f"Processed Spark records: {len(df):,}")
+    st.write(f"Distinct car parks: {df['facility_id'].nunique():,}")
+
+
+# =========================================================
+# 15. SOURCE AND LIMITATIONS
+# =========================================================
 st.divider()
 
 st.markdown(
     """
-    **Data source:** [UCI Machine Learning Repository — Parking Birmingham]
+    **Dataset:** [UCI Machine Learning Repository — Parking Birmingham]
     (https://archive.ics.uci.edu/dataset/482/parking%2Bbirmingham)
 
-    **Dataset citation:** Stolfi, D. (2017). *Parking Birmingham*.
+    **Citation:** Stolfi, D. (2017). *Parking Birmingham*.
     UCI Machine Learning Repository. DOI: 10.24432/C51K5Z.
     """
 )
 
 st.warning(
-    "This dashboard uses historical Birmingham parking observations "
-    "from October to December 2016. It does not connect to live parking "
-    "sensors. Predictions and estimated free-space counts are not "
-    "guarantees of current availability."
+    "The data contains historical observations from 2016. The app does "
+    "not connect to live parking sensors. Prediction results are estimates."
 )
