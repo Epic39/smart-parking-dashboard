@@ -3,4 +3,5 @@ pandas
 numpy
 scikit-learn
 plotly
-ucimlrepo
+requests
+pyspark
