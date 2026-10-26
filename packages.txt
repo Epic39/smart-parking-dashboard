@@ -1,2 +1,2 @@
 
-openjdk-17-jre-headless
+default-jre-headless
